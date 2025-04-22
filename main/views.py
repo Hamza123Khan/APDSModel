@@ -1,6 +1,13 @@
+import ipaddress
+from urllib.parse import urlparse
 from rest_framework import viewsets
 from rest_framework import status
 from rest_framework.response import Response
+import re
+import tldextract
+import pandas as pd
+import numpy as np
+import joblib
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from .models import Attachments, Category, Emails, FAQs, Links, ReportAttributes, Reports
 from .serializers import (
@@ -207,6 +214,11 @@ class SpamClassifierView(APIView):
     tokenizer = None
     model_path = None
     tokenizer_path = None
+    url_model = None
+    url_model_path = None
+    selector = None
+    clf = None
+    feature_columns = None
 
     permission_classes = [IsAuthenticated]  # Add this to require authentication
     # permission_classes = [AllowAny]  # Add this to require authentication
@@ -216,8 +228,9 @@ class SpamClassifierView(APIView):
         # Define paths for model and tokenizer
         self.model_path = os.path.join(settings.BASE_DIR, 'main\\trainedModelFiles\\lstm_model.h5')
         self.tokenizer_path = os.path.join(settings.BASE_DIR, 'main\\trainedModelFiles\\tokenizer.json')
-        
-        # Load model and tokenizer once during initialization
+        self.url_model_path = os.path.join(settings.BASE_DIR, 'main\\trainedModelFiles\\phishing_model.pkl')
+        self.selector_path = os.path.join(settings.BASE_DIR, 'main\\trainedModelFiles\\feature_selector.pkl')
+        self.feature_coloumns_path = os.path.join(settings.BASE_DIR, 'main\\trainedModelFiles\\feature_columns.pkl')
         self.load_model_and_tokenizer()
 
     def load_model_and_tokenizer(self):
@@ -225,6 +238,7 @@ class SpamClassifierView(APIView):
             # Load the trained LSTM model
             self.model = load_model(self.model_path)
             print(f"Model loaded from {self.model_path}")
+            print(self.model.summary)
         except Exception as e:
             print(f"Error loading model: {e}")
 
@@ -233,15 +247,69 @@ class SpamClassifierView(APIView):
             with open(self.tokenizer_path, 'r') as json_file:
                 tokenizer_json = json.load(json_file)
             self.tokenizer = tokenizer_from_json(tokenizer_json)
+            for key, values in tokenizer_json:
+                print(f"{key}:{values[-1]}")
             print(f"Tokenizer loaded from {self.tokenizer_path}")
         except Exception as e:
             print(f"Error loading tokenizer: {e}")
+        try:
+            self.url_model = joblib.load(self.url_model_path)
+            print(f"URL Model loaded from {self.url_model_path}")
+        except Exception as e:
+            print(f"Error loading URL model: {e}")
+        try:
+            self.url_model = joblib.load(self.url_model_path)
+            self.selector = joblib.load(self.selector_path)
+            self.feature_columns = joblib.load(self.feature_coloumns_path)
+            print("additional components(classifies, feature coloumns, selector)")
+        except Exception as e:
+            print("error loading components",e)
 
     def preprocessing(self, email_content):
         """Preprocess email content for prediction."""
         test_sequences = self.tokenizer.texts_to_sequences([email_content])
         return pad_sequences(test_sequences, padding='post', maxlen=100)
-    
+    def count_special_chars(self,url):
+        """Count special characters in URL."""
+        return len(re.findall(r'[./?\-_@=]', url))
+    def has_ip(self,url):
+        """Check if URL contains an IP address."""
+        try:
+            ipaddress.ip_address(urlparse(url).netloc)
+            return 1
+        except ValueError:
+            return 0
+    def ExtractFeatures(self, url):
+        features = {}
+
+        # Extracting features correctly
+        features['url_length'] = len(url)  #  This should be a number, not zero!
+        features['num_special_chars'] = self.count_special_chars(url)  #  Count special characters
+        features['num_digits'] = sum(c.isdigit() for c in url)  #  Count digits
+        features['num_letters'] = sum(c.isalpha() for c in url)  #  Count letters
+        features['num_subdomains'] = len(tldextract.extract(url).subdomain.split('.'))  #  Count subdomains
+        features['has_ip'] = self.has_ip(url)  #  Check if URL contains an IP
+        features['uses_https'] = 1 if urlparse(url).scheme == 'https' else 0  #  HTTPS check
+
+        # Extract Top-Level Domain (TLD)
+        tld = tldextract.extract(url).suffix
+        top_tlds = ['com', 'org', 'net', 'edu', 'gov', 'co', 'info', 'biz', 'xyz', 'cn']
+        features['tld'] = tld if tld in top_tlds else 'other'
+
+        print("Extracted Raw Features:", features)  #  Debugging Output
+
+        # Convert to DataFrame
+        features_df = pd.DataFrame([features])
+
+        # One-hot encoding for TLD
+        features_df = pd.get_dummies(features_df, columns=['tld'], drop_first=True)
+
+        # Align with training features
+        features_df = features_df.reindex(columns=self.feature_columns, fill_value=0)
+
+        print("Final Processed Features:", features_df)  # Debugging Output
+
+        return features_df
     # def get(self, request, *args, **kwargs):
     #     """Handle the GET request and return a sample string."""
     #     # sample_string = "Congratulations! You WON the Lottery!!!."
@@ -252,21 +320,37 @@ class SpamClassifierView(APIView):
     #     # Determine if the email is spam or legitimate
     #     result = "Spam Email" if prediction_result[0] > 0.5 else "Legitimate Email"
     #     return Response({'Result':result}, status=status.HTTP_200_OK)
-
+    
     def post(self, request, *args, **kwargs):
         """Handle the POST request for spam classification."""
-        result = None
-        if request.method == "POST":
-            # Get email content from the request body
-            mail_content = request.data.get('email_content')
-            if mail_content:
-                # Preprocess the email content
-                processed_content = self.preprocessing(mail_content)
-                
-                # Predict with the model
-                prediction_result = self.model.predict(processed_content)
-                
-                # Determine if the email is spam or legitimate
-                result = "Spam Email" if prediction_result[0] > 0.5 else "Legitimate Email"
+        result = {"Email classification": "unknown", "Url_Classification": "unknown"}
         
+        if request.method == "POST":
+            # Get email content and URL content
+            mail_content = request.data.get('email_content')
+            Url_content = request.data.get('Url_content') or request.data.get('url_content')  # Case insensitive
+
+            print("Debug: Received email content:", mail_content)
+            print("Debug: Received URL content:", Url_content)
+
+            if mail_content:
+                processed_content = self.preprocessing(mail_content)
+                prediction_result = self.model.predict(processed_content)
+                result["Email classification"] = "Spam Email" if prediction_result[0] > 0.5 else "Legitimate Email"
+            
+            if Url_content:  # Changed from `elif` to `if` to allow processing both
+                print("Processing URL content:", Url_content)
+                test_features = self.ExtractFeatures(Url_content)
+                print("Extracted features:", test_features)
+
+                if self.selector is not None:
+                    test_features = self.selector.transform(test_features)
+                    print("Transformed features:", test_features)
+
+                if self.url_model is not None:
+                    predictions = self.url_model.predict(test_features)
+                    result["Url_Classification"] = "Phishing URL" if predictions[0] == 1 else "Legitimate URL"
+                else:
+                    print("Warning: URL Model is not loaded!")
+
         return Response({"result": result})
